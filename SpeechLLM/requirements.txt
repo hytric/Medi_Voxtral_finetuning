@@ -1,0 +1,17 @@
+torch
+torchaudio
+transformers
+datasets
+accelerate
+peft
+bitsandbytes
+wandb
+tensorboard
+jinja2
+simple-parsing
+librosa
+soundfile
+tqdm
+pandas
+scipy
+scikit-learn
