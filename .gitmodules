@@ -1,3 +1,0 @@
-[submodule "datagen/TTS/CosyVoice"]
-	path = datagen/TTS/CosyVoice
-	url = https://github.com/FunAudioLLM/CosyVoice.git
