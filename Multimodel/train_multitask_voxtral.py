@@ -31,47 +31,6 @@ from torch.utils.tensorboard import SummaryWriter
 # --------------------
 # 유틸: CER / ROUGE-L
 # --------------------
-try:
-    import pynvml
-    pynvml.nvmlInit()
-    _NVML_OK = True
-except Exception:
-    _NVML_OK = False
-
-class GpuStatLogger:
-    def __init__(self, writer, every:int=100, device_index:int=0, tag_prefix:str="gpu"):
-        self.w = writer
-        self.every = max(1, int(every))
-        self.dev = device_index
-        self.tag = tag_prefix
-
-    def maybe_log(self, trainer):
-        step = int(trainer.state.global_step or 0)
-        if step == 0 or step % self.every != 0 or self.w is None:
-            return
-        # PyTorch 메모리(GB)
-        cur = torch.cuda.memory_allocated() / 1e9
-        res = torch.cuda.memory_reserved() / 1e9
-        mx  = torch.cuda.max_memory_allocated() / 1e9
-        self.w.add_scalar(f"{self.tag}/mem_alloc_GB", cur, step)
-        self.w.add_scalar(f"{self.tag}/mem_reserved_GB", res, step)
-        self.w.add_scalar(f"{self.tag}/mem_max_alloc_GB", mx, step)
-
-        # NVML 있으면 util/전력도 함께
-        if _NVML_OK:
-            handle = pynvml.nvmlDeviceGetHandleByIndex(self.dev)
-            util = pynvml.nvmlDeviceGetUtilizationRates(handle)
-            power = None
-            try:
-                power = pynvml.nvmlDeviceGetPowerUsage(handle) / 1000.0  # W
-            except Exception:
-                pass
-            self.w.add_scalar(f"{self.tag}/util_gpu_pct", util.gpu, step)
-            self.w.add_scalar(f"{self.tag}/util_mem_pct", util.memory, step)
-            if power is not None:
-                self.w.add_scalar(f"{self.tag}/power_W", power, step)
-
-
 def _edit_distance(a: List[str], b: List[str]) -> int:
     dp = [[0]*(len(b)+1) for _ in range(len(a)+1)]
     for i in range(len(a)+1): dp[i][0] = i
@@ -124,18 +83,41 @@ def detect_task(x: Dict[str, Any]) -> Task:
 class JsonlDataset(Dataset):
     def __init__(self, paths: List[str]):
         self.rows: List[Dict[str, Any]] = []
+        self.idxs_by_task: Dict[Task, List[int]] = {'asr': [], 'sqa': [], 'tqa': []}
+
         for p in paths:
             with open(p, 'r', encoding='utf-8') as f:
-                for line in f:
-                    if not line.strip(): continue
-                    ex = json.loads(line)
-                    ex['task'] = detect_task(ex)
+                for ln, line in enumerate(f, start=1):
+                    s = line.strip()
+                    if not s:
+                        continue
+                    try:
+                        ex = json.loads(s)
+                    except Exception as e:
+                        raise ValueError(f"[JSONL parse] {p}:{ln} parse error: {e}\nline={s[:200]}")
+
+                    if not isinstance(ex, dict):
+                        raise TypeError(f"[JSONL type] {p}:{ln} not a dict: {repr(ex)[:200]}")
+
+                    task = detect_task(ex)
+                    if task not in ('asr','sqa','tqa'):
+                        raise ValueError(f"[JSONL task] {p}:{ln} unknown task for sample: {ex}")
+
+                    ex['task'] = task
                     self.rows.append(ex)
-        self.idxs_by_task: Dict[Task, List[int]] = {'asr': [], 'sqa': [], 'tqa': []}
-        for i, ex in enumerate(self.rows):
-            self.idxs_by_task[ex['task']].append(i)
-    def __len__(self): return len(self.rows)
-    def __getitem__(self, idx): return self.rows[idx]
+                    self.idxs_by_task[task].append(len(self.rows)-1)
+
+        if len(self.rows) == 0:
+            raise ValueError("[JSONL] No valid samples loaded. Check your paths and file contents.")
+
+    def __len__(self) -> int:
+        return len(self.rows)
+
+    def __getitem__(self, idx: int) -> Dict[str, Any]:
+        # 방어: 음수/범위 초과
+        if not (0 <= idx < len(self.rows)):
+            raise IndexError(f"[JSONL] index out of range: {idx} / {len(self.rows)}")
+        return self.rows[idx]
 
 class TaskWeightedSampler(WeightedRandomSampler):
     def __init__(self, dataset: JsonlDataset, task_probs: Tuple[float, float, float], num_samples: Optional[int]=None):
@@ -253,17 +235,33 @@ class DataCollatorVoxtral:
 
     def __call__(self, features: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
         encoded: List[Dict[str, torch.Tensor]] = []
-        for ex in features:
+        for i, ex in enumerate(features):
+            if not isinstance(ex, dict):
+                raise TypeError(f"[Collator] Expected dict but got {type(ex)} at batch_idx={i}: {repr(ex)[:200]}")
+            if "task" not in ex:
+                raise KeyError(f"[Collator] Missing 'task' key at batch_idx={i}, ex={repr(ex)[:200]}")
+    
             if ex['task'] == 'asr':
+                # ASR 필수 필드 확인
+                if not (ex.get('audio_path') or ex.get('audio')):
+                    raise KeyError(f"[Collator-ASR] Missing 'audio_path'/'audio' at batch_idx={i}")
+                if 'transcript' not in ex:
+                    # 학습에선 라벨 필요
+                    raise KeyError(f"[Collator-ASR] Missing 'transcript' at batch_idx={i}")
                 encoded.append(self._encode_asr(ex))
             else:
+                # SQA/TQA 필수 필드 확인
+                if not (ex.get('instruction') or ex.get('input')):
+                    raise KeyError(f"[Collator-CHAT] Missing 'instruction'/'input' at batch_idx={i}")
+                if not (ex.get('answer') or ex.get('output')):
+                    raise KeyError(f"[Collator-CHAT] Missing 'answer'/'output' at batch_idx={i}")
                 encoded.append(self._encode_chat(ex))
 
-        # 텍스트 pad
+        # ↓↓↓ pad_id도 eos로 고정 권장 (pad_token_id가 '.' 인 케이스 방지)
         pad_id = (
-            self.processor.tokenizer.pad_token_id
-            if getattr(self.processor.tokenizer, "pad_token_id", None) is not None
-            else self.processor.tokenizer.eos_token_id
+            self.processor.tokenizer.eos_token_id
+            if getattr(self.processor.tokenizer, "eos_token_id", None) is not None
+            else 0
         )
         ids = pad_sequence([e["input_ids"] for e in encoded], batch_first=True, padding_value=pad_id)
         am  = pad_sequence([e["attention_mask"] for e in encoded], batch_first=True, padding_value=0)
@@ -298,73 +296,157 @@ class DataCollatorVoxtral:
         return batch
 
 # --------------------
-# Preview 콜백(샘플 텍스트 로깅)
+# Preview 콜백(샘플 텍스트/음성 로깅) — 학습 경로와 정합
+# --------------------
+# --------------------
+# Preview 콜백(샘플 텍스트 로깅) - ASR/QA 분기 일치
 # --------------------
 class PreviewCallback:
-    def __init__(self, tokenizer, writer: SummaryWriter, preview_samples: List[Dict[str, Any]],
-                 device: str, max_new_tokens: int = 128, global_step_interval: int = 1500):
-        self.tok = tokenizer
+    """
+    일정 global_step마다 몇 개 샘플을 골라,
+    - ASR: Whisper 프롬프트 + 오디오 피처를 넣어 디코딩
+    - SQA/TQA: chat template로 디코딩
+    결과 텍스트를 TensorBoard에 기록
+    """
+    def __init__(
+        self,
+        processor,                       # ⟵ AutoProcessor 전체를 받는다
+        writer: SummaryWriter,
+        preview_samples: List[Dict[str, Any]],
+        device: str,
+        max_new_tokens: int = 128,
+        global_step_interval: int = 1500,
+        debug: bool = False,
+    ):
+        self.proc = processor            # ⟵ 저장
+        self.tok = processor.tokenizer   # ⟵ tokenizer 핸들
         self.writer = writer
         self.samples = preview_samples
         self.device = device
         self.max_new_tokens = max_new_tokens
         self.interval = global_step_interval
         self._last_logged = -1
+        self.debug = debug
+
+    def _build_asr_inputs(self, processor, ex: Dict[str, Any], device):
+        """
+        학습 collator의 _encode_asr와 동일한 입력을 만든다.
+        반환: dict(input_ids, input_features)
+        """
+        req = processor.apply_transcription_request(
+            language=ex.get("language", "ko"),
+            audio=ex.get("audio_path") or ex.get("audio"),
+            model_id=getattr(processor, "model_input_name", None) or "",  # model_id가 필요없으면 무시됨
+        )
+        prompt_ids = req["input_ids"]
+        if not torch.is_tensor(prompt_ids):
+            prompt_ids = torch.tensor(prompt_ids, dtype=torch.long)
+        if prompt_ids.dim() == 2 and prompt_ids.shape[0] == 1:
+            prompt_ids = prompt_ids.squeeze(0)
+
+        feats = req["input_features"]
+        if not torch.is_tensor(feats):
+            feats = torch.tensor(feats, dtype=torch.float)
+        if feats.dim() == 3 and feats.shape[0] == 1:
+            feats = feats.squeeze(0)
+        if feats.dim() != 2:  # (T, F)
+            feats = feats.view(-1, feats.shape[-1])
+
+        return {
+            "input_ids": prompt_ids.to(device).unsqueeze(0),     # (1, Lprompt)
+            "input_features": feats.to(device).unsqueeze(0),     # (1, T, F)
+        }
+
+    def _build_chat_inputs(self, tokenizer, ex: Dict[str, Any], device):
+        """
+        user-only 프롬프트를 만들어 generate용 input_ids를 반환.
+        """
+        question = (ex.get("instruction") or ex.get("input") or "").strip()
+        messages = [{"role": "user", "content": question}]
+        enc = tokenizer.apply_chat_template(
+            messages, tokenize=True, return_tensors="pt"
+        ).to(device)
+        return {"input_ids": enc}
 
     def maybe_log(self, trainer: Trainer):
         step = int(trainer.state.global_step or 0)
         if step == 0 or step == self._last_logged or step % self.interval != 0:
             return
         self._last_logged = step
+        if self.debug:
+            print(f"[preview] logging at step={step}, num_samples={len(self.samples)}")
 
         model = trainer.model
         model.eval()
-        device = next(model.parameters()).device
+        model_device = next(model.parameters()).device
+
+        had_gc = getattr(model, "is_gradient_checkpointing", False)
+        if had_gc:
+            try:
+                model.gradient_checkpointing_disable()
+            except Exception:
+                pass
 
         with torch.no_grad():
             for idx, ex in enumerate(self.samples):
-                ins = (ex.get("instruction") or ex.get("input") or "").strip()
+                task = detect_task(ex)  # 'asr' | 'sqa' | 'tqa'
                 ref = (ex.get("output") or ex.get("answer") or ex.get("transcript") or "").strip()
-        
-                messages = [{"role": "user", "content": ins}]
-                enc = self.tok.apply_chat_template(
-                    messages, tokenize=True, return_tensors="pt"
-                ).to(device)
-        
-                # use_cache 토글
-                prev_use_cache = getattr(model.config, "use_cache", False)
-                model.config.use_cache = True
-        
-                gen_ids = model.generate(
-                    input_ids=enc,
-                    max_new_tokens=self.max_new_tokens,
-                    do_sample=False,
-                    temperature=0.0,
-                    eos_token_id=self.tok.eos_token_id,
-                    pad_token_id=self.tok.pad_token_id,
-                )
-        
-                # 생성 결과 디코딩
-                out_ids = gen_ids[0, enc.shape[1]:]
-                pred = self.tok.decode(out_ids, skip_special_tokens=True)
-        
-                # ✅ 줄바꿈/포맷 오류 수정된 프리뷰 텍스트
-                text = (
-                    f"[Q] {(ex.get('instruction') or ex.get('input') or 'ASR')[:200]}\n"
-                    f"[REF] {ref}\n"
-                    f"[PRED] {pred}"
-                )
-                if self.writer is not None:
-                    self.writer.add_text(f"preview/sample_{idx}", text, global_step=step)
-        
-                # 메모리 즉시 반환(텐서/캐시)
-                del out_ids, gen_ids, enc
-                import gc
-                gc.collect()
-                torch.cuda.empty_cache()
-        
-                # use_cache 복원
-                model.config.use_cache = prev_use_cache
+
+                # generate 파라미터 공통
+                prev_cache = getattr(model.config, "use_cache", False)
+                if hasattr(model.config, "use_cache"):
+                    model.config.use_cache = True
+
+                try:
+                    if task == "asr":
+                        # ASR: whisper prompt + audio features
+                        io = self._build_asr_inputs(self.proc, ex, model_device)
+                        gen_ids = model.generate(
+                            input_ids=io["input_ids"],                 # (1, Lprompt)
+                            input_features=io["input_features"],       # (1, T, F)
+                            max_new_tokens=self.max_new_tokens,
+                            do_sample=False,
+                            eos_token_id=model.config.eos_token_id,
+                            pad_token_id=model.config.pad_token_id,
+                        )
+                        # ASR은 prompt 이후가 모델의 전사 결과
+                        out_ids = gen_ids[0, io["input_ids"].shape[1]:]
+
+                    else:
+                        # SQA/TQA: chat-template 프롬프트
+                        enc = self._build_chat_inputs(self.tok, ex, model_device)["input_ids"]
+                        gen_ids = model.generate(
+                            input_ids=enc,
+                            max_new_tokens=self.max_new_tokens,
+                            do_sample=False,
+                            eos_token_id=model.config.eos_token_id,
+                            pad_token_id=model.config.pad_token_id,
+                        )
+                        out_ids = gen_ids[0, enc.shape[1]:]
+
+                    pred = self.tok.decode(out_ids, skip_special_tokens=True)
+
+                    # 로그 텍스트
+                    question = (ex.get("instruction") or ex.get("input") or "ASR")[:200]
+                    text = f"[Task] {task}\n[Q] {question}\n[REF] {ref}\n[PRED] {pred}"
+
+                    if self.writer is not None:
+                        self.writer.add_text(f"preview/sample_{idx}", text, global_step=step)
+
+                    if self.debug:
+                        print(f"[preview] sample#{idx}\n{text}")
+
+                finally:
+                    if hasattr(model.config, "use_cache"):
+                        model.config.use_cache = prev_cache
+
+        if had_gc:
+            try:
+                model.gradient_checkpointing_enable()
+                if hasattr(model.config, "use_cache"):
+                    model.config.use_cache = False
+            except Exception:
+                pass
 
         model.train()
 
@@ -372,10 +454,9 @@ class PreviewCallback:
 # 커스텀 Trainer: 수동 주기 평가 + 미리보기
 # --------------------
 class FastTrainer(Trainer):
-    def __init__(self, *args, preview_cb=None, gpu_logger=None, **kwargs):
+    def __init__(self, *args, preview_cb: Optional[PreviewCallback]=None, **kwargs):
         super().__init__(*args, **kwargs)
         self.preview_cb = preview_cb
-        self.gpu_logger = gpu_logger
 
     def _build_loader(self, dataset, batch_size: int, shuffle: bool, data_collator,
                       num_workers: int, prefetch_factor: int, pin_memory: bool, drop_last: bool, sampler=None):
@@ -414,21 +495,22 @@ class FastTrainer(Trainer):
         )
 
     def training_step(self, *args, **kwargs):
+        # 미리보기
         if self.preview_cb is not None:
             self.preview_cb.maybe_log(self)
 
         out = super().training_step(*args, **kwargs)
 
-        # <-- 여기서 주기적으로 GPU 스탯 로깅
-        if self.gpu_logger is not None:
-            self.gpu_logger.maybe_log(self)
-
-        # (기존 수동 평가 로직 유지)
+        # 수동 평가(구형 트레이너 호환)
         step = int(self.state.global_step or 0)
         interval = getattr(self.args, '_manual_eval_interval', 0)
         if interval and step > 0 and step % interval == 0:
-            try: self.evaluate()
-            except Exception as e: print(f"[warn] manual evaluate failed at step {step}: {e}")
+            try:
+                self.evaluate()
+            except Exception as e:
+                import traceback
+                print(f"[warn] manual evaluate failed at step {step}: {e}")
+                traceback.print_exc()
         return out
 
 # --------------------
@@ -478,9 +560,6 @@ def parse_args():
 
     ap.add_argument('--load_4bit', action='store_true')
     ap.add_argument('--bnb_dtype', type=str, default='bfloat16')
-
-    ap.add_argument('--gpu_log_every', type=int, default=100, help='TensorBoard에 GPU 스탯을 기록할 step 간격')
-    ap.add_argument('--gpu_index', type=int, default=0, help='기록할 GPU index (단일 GPU는 0)')
     return ap.parse_args()
 
 
@@ -488,18 +567,11 @@ def main():
     args = parse_args()
 
     if args.tf32:
-        import torch
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
 
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     print(f"[Device] {device}")
-
-    # main() 상단 어딘가(모델 로드 전) 추가
-    import torch.backends.cuda
-    torch.backends.cuda.matmul.allow_tf32 = True
-    from torch.backends.cuda import sdp_kernel
-    sdp_kernel(enable_flash=True, enable_mem_efficient=True, enable_math=False)
 
     processor = AutoProcessor.from_pretrained(args.model_id)
 
@@ -518,6 +590,25 @@ def main():
         model = VoxtralForConditionalGeneration.from_pretrained(
             args.model_id, torch_dtype=dtype, device_map=device
         )
+
+    tok = processor.tokenizer
+    # eos는 기존대로 tokenizer가 제공하는 값 사용
+    eos_id = tok.eos_token_id
+    assert eos_id is not None and eos_id != -1, "Tokenizer must have eos_token_id"
+    
+    # pad는 tokenizer에 정의된 값 그대로 사용
+    pad_id = tok.pad_token_id
+    assert pad_id is not None and pad_id != -1, "Tokenizer must have pad_token_id"
+    
+    # 모델 설정
+    model.config.eos_token_id = eos_id
+    model.config.pad_token_id = pad_id   # 🚨 eos가 아니라 tokenizer.pad_token_id 사용
+    try:
+        tok.pad_token_id = pad_id        # tokenizer에도 반영
+    except Exception:
+        pass
+    
+    print(f"[Tokenizer] eos_id={eos_id}, pad_id={pad_id}")
 
     # Whisper/audio encoder freeze
     for n, p in model.named_parameters():
@@ -557,10 +648,13 @@ def main():
 
     collator = DataCollatorVoxtral(processor=processor, model_id=args.model_id, max_len=args.max_len, language='ko')
 
-    # 미리보기 샘플
     def _pick(ds: JsonlDataset, task: Task, k: int) -> List[Dict[str, Any]]:
-        idxs = ds.idxs_by_task[task][:]
+        pool = ds.idxs_by_task.get(task, [])
+        if not pool:
+            return []  # 해당 태스크 표본이 없으면 빈 리스트
+        idxs = pool[:]  # shallow copy
         random.shuffle(idxs)
+        # ✅ 인덱싱 시 __getitem__ 정상 동작
         return [ds[i] for i in idxs[:k]]
     preview_samples = []
     preview_samples += _pick(train_ds, 'asr', args.preview_n)
@@ -586,7 +680,6 @@ def main():
         bf16=args.bf16,
         tf32=args.tf32,
         gradient_checkpointing=args.grad_ckpt,
-        optim="adamw_torch_fused",
         report_to=['tensorboard'],
         eval_accumulation_steps=args.eval_accumulation_steps,
         lr_scheduler_type=('cosine' if args.cosine else 'linear'),
@@ -605,29 +698,29 @@ def main():
 
     writer = SummaryWriter(log_dir=os.path.join(args.output_dir, 'runs'))
     preview_cb = PreviewCallback(
-        tokenizer=processor.tokenizer, writer=writer,
-        preview_samples=preview_samples, device=device,
+        processor=processor,
+        writer=writer,
+        preview_samples=preview_samples,
+        device=device,
         max_new_tokens=args.preview_max_new_tokens,
         global_step_interval=args.preview_steps,
     )
-    
-    gpu_logger = GpuStatLogger(
-        writer=writer,
-        every=args.gpu_log_every,
-        device_index=args.gpu_index,
-        tag_prefix="gpu"  # 필요하면 바꿔도 됨
-    )
-    
+
+    from torch.utils.data import ConcatDataset
+    eval_union = ConcatDataset([val_asr, val_sqa, val_tqa])
+
     trainer = FastTrainer(
         model=model,
         args=targs,
         train_dataset=train_ds,
-        eval_dataset={'asr': val_asr, 'sqa': val_sqa, 'tqa': val_tqa},
+        eval_dataset=eval_union,
         data_collator=collator,
-        tokenizer=processor.tokenizer,
+        processing_class=processor,
         preview_cb=preview_cb,
-        gpu_logger=gpu_logger,
     )
+
+    assert len(train_ds) > 0, "train_jsonl에서 유효 샘플을 찾지 못했습니다."
+    print("[Train pool sizes]", {k: len(v) for k, v in train_ds.idxs_by_task.items()})
 
     trainer.train()
     print('[Evaluate] ASR/SQA/TQA (final)')
@@ -641,3 +734,5 @@ def main():
 
 if __name__ == '__main__':
     main()
+
+    
